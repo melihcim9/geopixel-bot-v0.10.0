@@ -1,0 +1,930 @@
+// ==UserScript==
+// @name         GhostPixel Bot (Owned-Color Detection & Mix Mode)
+// @namespace    https://github.com/melihcim9
+// @version      0.10.1
+// @description  GeoPixels bot that detects your owned account colors (Colors global) and only places those. Mix mode, Blocks-First mode, live energy, progress bar, stats, ignore-colors, sound.
+// @author       nymtuta & Expert Developer
+// @match        https://*.geopixels.net/*
+// @updateURL    https://github.com/nymtuta/GeoPixelsBot/raw/refs/heads/main/ghostBot.user.js
+// @downloadURL  https://github.com/nymtuta/GeoPixelsBot/raw/refs/heads/main/ghostBot.user.js
+// @homepage     https://github.com/nymtuta/GeoPixelsBot
+// @icon         https://raw.githubusercontent.com/nymtuta/GeoPixelsBot/refs/heads/main/img/icon.png
+// @license      GPL-3.0
+// @grant        unsafeWindow
+// ==/UserScript==
+
+//#region Utils
+Number.prototype.iToH = function () {
+    return this.toString(16).padStart(2, "0");
+};
+String.prototype.hToI = function () {
+    return parseInt(this, 16);
+};
+
+String.prototype.toFullHex = function () {
+    let h = this.toLowerCase();
+    if (!h.startsWith("#")) h = `#${h}`;
+    if (h.length === 4 || h.length === 5) h = "#" + [...h.slice(1)].map((c) => c + c).join("");
+    if (h.length === 7) h += "ff";
+    return h;
+};
+
+class Color {
+    constructor(arg = {}) {
+        if (typeof arg === "string") return this.constructorFromHex(arg);
+        if (typeof arg === "number") return this.constructorFromId(arg);
+        this.r = arg.r;
+        this.g = arg.g;
+        this.b = arg.b;
+        this.a = arg.a === undefined || arg.a === null ? 255 : arg.a;
+    }
+
+    constructorFromHex(hex) {
+        hex = hex.toFullHex();
+        var r = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+        if (!r) throw new Error("Invalid hex color: " + hex);
+        this.r = r[1].hToI();
+        this.g = r[2].hToI();
+        this.b = r[3].hToI();
+        this.a = r[4].hToI();
+    }
+
+    constructorFromId(id) {
+        if (id === -1) {
+            this.r = this.g = this.b = this.a = 0;
+            return;
+        }
+        this.r = (id >> 16) & 0xff;
+        this.g = (id >> 8) & 0xff;
+        this.b = id & 0xff;
+        this.a = 255;
+    }
+
+    rgbaString = () => `rgba(${this.r},${this.g},${this.b},${this.a})`;
+
+    hex = () => "#" + [this.r, this.g, this.b, this.a].map((x) => x.iToH()).join("");
+
+    id = () => (this.a === 0 ? -1 : (this.r << 16) + (this.g << 8) + this.b);
+}
+
+const pixelToGridCoord = (i, topLeft, width) => ({
+    x: topLeft.x + (i % width),
+    y: topLeft.y - Math.floor(i / width),
+});
+
+function coordToTileCoord({ x, y }) {
+    return {
+        x: Math.floor(x / SYNC_TILE_SIZE) * SYNC_TILE_SIZE,
+        y: Math.floor(y / SYNC_TILE_SIZE) * SYNC_TILE_SIZE,
+    };
+}
+
+function getAllCoordsBetween(a, b, size = 1) {
+    const coords = [];
+    for (let x = Math.min(a.x, b.x); x <= Math.max(a.x, b.x); x += size)
+        for (let y = Math.min(a.y, b.y); y <= Math.max(a.y, b.y); y += size) coords.push({ x, y });
+    return coords;
+}
+
+const LOG_LEVELS = {
+    error: { label: "ERR", color: "#f87171" },
+    info: { label: "INF", color: "#4ade80" },
+    warn: { label: "WRN", color: "#facc15" },
+    debug: { label: "DBG", color: "#38bdf8" },
+};
+
+function log(lvl, ...args) {
+    console.log(
+        `%c[ghostBot] %c[${lvl.label}]`,
+        "color: rebeccapurple;",
+        `color:${lvl.color};`,
+        ...args
+    );
+
+    const logBox = document.getElementById("gp-ui-log");
+    if (logBox) {
+        const msg = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : arg).join(' ');
+        logBox.innerHTML += `<div style="color: ${lvl.color};">[${lvl.label}] ${msg}</div>`;
+        while (logBox.childElementCount > 80) logBox.removeChild(logBox.firstChild);
+        logBox.scrollTop = logBox.scrollHeight;
+    }
+}
+
+function setStatus(text, color) {
+    const el = document.getElementById("gp-status-text");
+    if (el) { el.textContent = text; el.style.color = color || "#a1a1aa"; }
+    const dot = document.getElementById("gp-status-dot");
+    if (dot && color) dot.style.background = color;
+}
+
+function playBeep(freq = 880, dur = 0.15) {
+    try {
+        const AC = unsafeWindow.AudioContext || unsafeWindow.webkitAudioContext;
+        const ctx = new AC();
+        const o = ctx.createOscillator();
+        const g = ctx.createGain();
+        o.connect(g); g.connect(ctx.destination);
+        o.frequency.value = freq;
+        g.gain.value = 0.05;
+        o.start();
+        o.stop(ctx.currentTime + dur);
+        setTimeout(() => ctx.close(), (dur + 0.1) * 1000);
+    } catch (e) { /* ses yoksa sessiz devam */ }
+}
+
+function canvasToImageData(canvasData, x, y, existingMap = new Map()) {
+    for (let i = 0; i < canvasData.data.length; i += 4) {
+        const gridCoord = pixelToGridCoord(i / 4, { x, y }, canvasData.width);
+        const color = new Color({
+            r: canvasData.data[i],
+            g: canvasData.data[i + 1],
+            b: canvasData.data[i + 2],
+            a: canvasData.data[i + 3],
+        });
+        existingMap.set(`${gridCoord.x},${gridCoord.y}`, { gridCoord, color });
+    }
+    return existingMap;
+}
+
+function loadImageAsync(src) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = reject;
+        img.src = src;
+    });
+}
+
+async function webpToCanvasData(webp, width, height) {
+    const img = await loadImageAsync(`data:image/webp;base64,${webp}`);
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    ctx.translate(0, height);
+    ctx.scale(1, -1);
+    ctx.drawImage(img, 0, 0);
+    const canvasData = ctx.getImageData(0, 0, width, height);
+    canvas.remove();
+    return canvasData;
+}
+webpToCanvasData = withErrorHandling(webpToCanvasData);
+
+const FREE_COLORS = [
+    "#FFFFFF",
+    "#FFCA3A",
+    "#FF595E",
+    "#F3BBC2",
+    "#BD637D",
+    "#6A4C93",
+    "#A8D0DC",
+    "#1A535C",
+    "#1982C4",
+    "#8AC926",
+    "#6B4226",
+    "#CFD078",
+    "#8B1D24",
+    "#C49A6C",
+    "#000000",
+    "#00000000",
+].map((c) => new Color(c));
+
+const FREE_COLOR_IDS = new Set(FREE_COLORS.map((c) => c.id()));
+
+function withErrorHandling(asyncFn) {
+    return async function (...args) {
+        try {
+            return await asyncFn(...args);
+        } catch (e) {
+            log(LOG_LEVELS.error, e);
+        }
+    };
+}
+
+// Gruplari orantisel olarak harmanlar (buyuk gruptan daha sik alir)
+function interleaveGroups(groups) {
+    const result = [];
+    const total = groups.reduce((s, g) => s + g.length, 0);
+    const idx = groups.map(() => 0);
+    while (result.length < total) {
+        let best = -1, bestRatio = -1;
+        groups.forEach((g, i) => {
+            if (idx[i] < g.length) {
+                const ratio = (g.length - idx[i]) / g.length;
+                if (ratio > bestRatio) { bestRatio = ratio; best = i; }
+            }
+        });
+        result.push(groups[best][idx[best]++]);
+    }
+    return result;
+}
+
+const SYNC_TILE_SIZE = 1000;
+//#endregion
+
+(function () {
+    const usw = unsafeWindow;
+    let ghostPixelData, ghostData;
+    let placedPixelData = new Map();
+    let ignoredColors = new Set();
+    let lastServerTimestamp = 0;
+    let sessionPlacedCount = 0;
+    let statsStartTime = 0;
+    let statsTotal = 0;
+    let statsRemaining = 0;
+    let ownedColorSignature = "";
+    let ownedWarned = false;
+    let lastMixedComp = "";
+    let isRunning = false;
+    const GOOGLE_CLIENT_ID = document.getElementById("g_id_onload")?.getAttribute("data-client_id");
+
+    const savedFill = localStorage.getItem("gp_fill_method") || "mixed";
+    const savedThreshold = parseInt(localStorage.getItem("gp_energy_threshold")) || 40;
+    const savedTransparent = localStorage.getItem("gp_place_transparent") === "true";
+    const savedFree = localStorage.getItem("gp_place_free") !== "false";
+    const savedSound = localStorage.getItem("gp_sound") === "true";
+    const savedIgnored = localStorage.getItem("gp_ignored_colors") || "";
+    const savedOnlyOwned = localStorage.getItem("gp_only_owned") !== "false"; // default: acik
+
+    // ============================================================
+    // OWNED COLORS (hesaptaki renkler) — sitenin global Colors
+    // dizisi, kullanicinin SAHIP OLDUGU renklerin hex listesidir
+    // (son eleman silgi/ozel renktir, id() zaten eler).
+    // ============================================================
+    function readRawColors() {
+        try {
+            if (typeof Colors !== "undefined" && Array.isArray(Colors) && Colors.length)
+                return Colors;
+        } catch (e) { /* sandbox erisimi yok */ }
+        try {
+            if (Array.isArray(usw.Colors) && usw.Colors.length) return usw.Colors;
+        } catch (e) { }
+        return null;
+    }
+
+    function getOwnedColorIds() {
+        const raw = readRawColors();
+        if (!raw) return null;
+        return raw.map((c) => new Color(c).id());
+    }
+
+    function getOwnedColorsSignature() {
+        const raw = readRawColors();
+        return raw ? raw.join(",") : "";
+    }
+
+    function detectOwnedColors(showLog = true) {
+        const box = document.getElementById('gp-owned-swatches');
+        const countEl = document.getElementById('gp-owned-count');
+        const raw = readRawColors();
+
+        if (!raw) {
+            if (box) box.innerHTML = '<span style="color:#f87171; font-size:10px;">Hesap renkleri bulunamadi. Giris yaptigindan emin ol.</span>';
+            if (countEl) countEl.textContent = "?";
+            return null;
+        }
+
+        const ownedIds = raw.map((c) => new Color(c).id());
+        const ownedSet = new Set(ownedIds); // hizli lookup
+
+        // Ghost resminde bu renklerden kacar piksel var? (milyonlarca blok icin on izleme)
+        let countsHtml = "";
+        let matchTotal = 0;
+        try {
+            if (typeof ghostImageOriginalData !== "undefined" && ghostImageOriginalData && typeof ghostImageTopLeft !== "undefined" && ghostImageTopLeft) {
+                if (!ghostData) setGhostPixelData();
+                const freq = new Map();
+                ghostData.forEach((d) => {
+                    const v = d.color.id();
+                    if (ownedSet.has(v)) {
+                        freq.set(v, (freq.get(v) || 0) + 1);
+                        matchTotal++;
+                    }
+                });
+                countsHtml = [...freq.entries()]
+                    .sort((a, b) => b[1] - a[1])
+                    .map(([id, n]) => {
+                        const col = new Color(id);
+                        const isFree = FREE_COLOR_IDS.has(id);
+                        return `<div style="display:flex; align-items:center; gap:4px; font-size:9px; color:#a1a1aa;">
+                            <span style="width:10px; height:10px; border-radius:2px; background:${col.rgbaString()}; border:1px solid #3f3f46; display:inline-block;"></span>
+                            <span>${col.hex().slice(0, 7)}${isFree ? " (free)" : ""}</span>
+                            <span style="color:#4ade80; margin-left:auto;">${n.toLocaleString()} blok</span>
+                        </div>`;
+                    }).join("");
+            }
+        } catch (e) { /* ghost yuklu degil */ }
+
+        if (box) {
+            box.innerHTML = `
+                <div style="font-size:9px; color:#4ade80; margin-bottom:3px;">Hesabindaki renklerle bu ghost imagedan <strong style="color:#facc15;">${matchTotal.toLocaleString()}</strong> piksel cikiyor:</div>
+                <div style="display:flex; flex-direction:column; gap:2px; max-height:90px; overflow-y:auto;">${countsHtml || '<span style="font-size:9px; color:#a1a1aa;">Ghost image yuklu degil, sayi hesaplanamadi.</span>'}</div>
+            `;
+        }
+        if (countEl) countEl.textContent = String(raw.length);
+        if (showLog) log(LOG_LEVELS.info, `Renk algilandi: ${raw.length} renk. Ghost ile eslesen toplam ${matchTotal.toLocaleString()} piksel.`);
+        return ownedIds;
+    }
+
+    usw.ghostBot = {
+        fillMethod: savedFill,
+        targetEnergyThreshold: savedThreshold,
+        placeTransparentGhostPixels: savedTransparent,
+        placeFreeColors: savedFree,
+        soundEnabled: savedSound,
+        onlyOwnedColors: savedOnlyOwned,
+        detectColors: () => detectOwnedColors(),
+        ignoreColors: withErrorHandling((input, sep = ",") => {
+            if (input === undefined) input = [];
+            if (!Array.isArray(input)) input = input.split(sep);
+            ignoredColors = new Set(input.filter(c => c && c.trim()).map((c) => new Color(c.trim()).id()));
+            localStorage.setItem("gp_ignored_colors", input.filter(c => c && c.trim()).join(","));
+            ghostPixelData = null;
+            log(LOG_LEVELS.info, "New ignored colors :", ignoredColors);
+        }),
+        start: () => startGhostBot(),
+        stop: () => {
+            stopWhileLoop = true;
+            promiseResolve?.();
+            log(LOG_LEVELS.info, "Ghost bot stopped");
+            setStatus("Durdu", "#ef4444");
+        },
+        reload: () => {
+            setGhostPixelData();
+            placedPixelData.clear();
+            lastServerTimestamp = 0;
+            updatePlacedPixels();
+        },
+    };
+
+    // Kayitli yoksayilan renkleri baslangicta uygula
+    if (savedIgnored) usw.ghostBot.ignoreColors(savedIgnored);
+
+    function createUI() {
+        if (document.getElementById('ghost-bot-ui')) return;
+
+        const panel = document.createElement('div');
+        panel.id = 'ghost-bot-ui';
+        panel.style.cssText = `
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            width: 320px;
+            max-height: 90vh;
+            overflow-y: auto;
+            background: #18181b;
+            color: #f4f4f5;
+            border: 1px solid #27272a;
+            border-radius: 10px;
+            padding: 12px;
+            z-index: 999999;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+        `;
+
+        panel.innerHTML = `
+            <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #27272a; padding-bottom: 8px; margin-bottom: 8px;">
+                <div style="display: flex; align-items: center; gap: 6px;">
+                    <span id="gp-status-dot" style="width: 8px; height: 8px; background: #ef4444; border-radius: 50%;"></span>
+                    <h3 style="margin: 0; font-size: 13px; font-weight: 600; color: #f4f4f5;">GhostPixel Bot UI</h3>
+                </div>
+                <div style="display:flex; align-items:center; gap:6px;">
+                    <span id="gp-status-text" style="font-size:10px; color:#a1a1aa;">Hazir</span>
+                    <button id="gp-shrink-btn" style="background: #27272a; border: none; color: #a1a1aa; border-radius: 4px; width: 22px; height: 22px; cursor: pointer; font-weight: bold; font-size: 13px;">−</button>
+                </div>
+            </div>
+
+            <div id="gp-body" style="display: block;">
+                <div style="display: flex; gap: 8px; margin-bottom: 8px;">
+                    <div style="flex: 1;">
+                        <label style="display: block; font-size: 10px; color: #a1a1aa; margin-bottom: 2px;">Fill Method:</label>
+                        <select id="gp-fill-method" style="width: 100%; padding: 5px; background: #27272a; border: 1px solid #3f3f46; color: #fff; border-radius: 4px; font-size: 11px;">
+                            <option value="mixed" ${savedFill === 'mixed' ? 'selected' : ''}>Mix (Ucretsiz + Ucretli)</option>
+                            <option value="blocks_first" ${savedFill === 'blocks_first' ? 'selected' : ''}>Blocks First (cok bloku once bitir)</option>
+                            <option value="frequency" ${savedFill === 'frequency' ? 'selected' : ''}>Frequency (Default)</option>
+                            <option value="random" ${savedFill === 'random' ? 'selected' : ''}>Random / Scrambled</option>
+                            <option value="top_to_bottom" ${savedFill === 'top_to_bottom' ? 'selected' : ''}>Top to Bottom</option>
+                            <option value="bottom_to_top" ${savedFill === 'bottom_to_top' ? 'selected' : ''}>Bottom to Top</option>
+                            <option value="left_to_right" ${savedFill === 'left_to_right' ? 'selected' : ''}>Left to Right</option>
+                            <option value="right_to_left" ${savedFill === 'right_to_left' ? 'selected' : ''}>Right to Left</option>
+                            <option value="diagonal" ${savedFill === 'diagonal' ? 'selected' : ''}>Diagonal Sweep</option>
+                            <option value="nearest" ${savedFill === 'nearest' ? 'selected' : ''}>Nearest Neighbor</option>
+                        </select>
+                    </div>
+                    <div style="width: 95px;">
+                        <label style="display: block; font-size: 10px; color: #a1a1aa; margin-bottom: 2px;" title="Minimum energy required to trigger placement">Trigger Energy:</label>
+                        <input type="number" id="gp-energy-threshold" value="${savedThreshold}" min="1" style="width: 100%; padding: 4px; background: #27272a; border: 1px solid #3f3f46; color: #fff; border-radius: 4px; box-sizing: border-box; font-size: 11px; text-align: center;">
+                    </div>
+                </div>
+
+                <div style="display: flex; gap: 6px; margin-bottom: 8px;">
+                    <button id="gp-start-btn" style="flex: 1; padding: 6px; background: #22c55e; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; font-size: 11px;">Start</button>
+                    <button id="gp-stop-btn" style="flex: 1; padding: 6px; background: #ef4444; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; font-size: 11px;">Stop</button>
+                    <button id="gp-reload-btn" style="padding: 6px 10px; background: #3b82f6; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 11px;">Reload</button>
+                </div>
+
+                <div style="font-size: 11px; margin-bottom: 8px; display: flex; flex-direction: column; gap: 4px;">
+                    <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;" title="Sadece hesabinda sahip oldugun renkleri koyar. KAPALI olursa sitede var olan her rengi dener.">
+                        <input type="checkbox" id="gp-toggle-owned" ${savedOnlyOwned ? 'checked' : ''} style="accent-color: #f59e0b;"> Sadece hesabimdaki renkleri kullan (<strong id="gp-owned-count" style="color:#facc15;">?</strong> renk)
+                    </label>
+                    <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
+                        <input type="checkbox" id="gp-toggle-transparent" ${savedTransparent ? 'checked' : ''} style="accent-color: #3b82f6;"> Place Transparent Pixels
+                    </label>
+                    <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
+                        <input type="checkbox" id="gp-toggle-free" ${savedFree ? 'checked' : ''} style="accent-color: #3b82f6;"> Place Free Colors
+                    </label>
+                    <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
+                        <input type="checkbox" id="gp-toggle-sound" ${savedSound ? 'checked' : ''} style="accent-color: #3b82f6;"> Ses Bildirimi (batch basina beep)
+                    </label>
+                </div>
+
+                <div style="margin-bottom: 8px; padding: 6px; background: #09090b; border: 1px solid #27272a; border-radius: 4px;">
+                    <div style="display:flex; justify-content: space-between; align-items:center; margin-bottom: 4px;">
+                        <span style="font-size: 10px; color: #a1a1aa;">Hesap Renkleri Analizi</span>
+                        <button id="gp-detect-btn" style="padding: 3px 8px; background: #f59e0b; color: #18181b; border: none; border-radius: 4px; cursor: pointer; font-size: 10px; font-weight: 600;">Yenile / Algila</button>
+                    </div>
+                    <div id="gp-owned-swatches" style="font-size: 9px; color: #a1a1aa;">Renkler bekleniyor...</div>
+                </div>
+
+                <div style="font-size: 10px; color: #a1a1aa; margin-bottom: 8px;">
+                    <label style="display: block; margin-bottom: 2px;">Yoksayilan Renkler (hex, virgulle):</label>
+                    <div style="display: flex; gap: 4px;">
+                        <input type="text" id="gp-ignore-input" placeholder="#ff0000, #00ff00" value="${savedIgnored}" style="flex:1; padding: 4px; background: #27272a; border: 1px solid #3f3f46; color: #fff; border-radius: 4px; font-size: 10px; box-sizing: border-box;">
+                        <button id="gp-ignore-btn" style="padding: 4px 8px; background: #a855f7; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 10px;">Uygula</button>
+                    </div>
+                </div>
+
+                <div style="margin-bottom: 6px;">
+                    <div style="display:flex; justify-content: space-between; font-size:10px; color:#a1a1aa; margin-bottom: 2px;">
+                        <span>Ilerleme</span>
+                        <span id="gp-progress-text">0%</span>
+                    </div>
+                    <div style="width:100%; height:6px; background:#27272a; border-radius:3px; overflow:hidden;">
+                        <div id="gp-progress-bar" style="width:0%; height:100%; background: linear-gradient(90deg, #22c55e, #4ade80); transition: width 0.5s;"></div>
+                    </div>
+                </div>
+
+                <div style="font-size: 10px; color: #a1a1aa; margin-bottom: 6px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px;">
+                    <span>Placed: <strong id="gp-placed-counter" style="color: #4ade80;">0</strong></span>
+                    <span>Enerji: <strong id="gp-energy-display" style="color: #facc15;">?</strong></span>
+                    <span>Hiz: <strong id="gp-rate-display" style="color: #38bdf8;">0</strong>/dk</span>
+                    <span>Sure: <strong id="gp-time-display" style="color: #e879f9;">00:00</strong></span>
+                </div>
+
+                <div id="gp-ui-log" style="font-size: 10px; background: #09090b; padding: 6px; border-radius: 4px; border: 1px solid #27272a; height: 85px; overflow-y: auto; font-family: monospace;">
+                    <div style="color: #38bdf8;">[INF] GhostPixel UI v0.10.1 initialized.</div>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(panel);
+
+        document.getElementById('gp-shrink-btn').addEventListener('click', () => {
+            const body = document.getElementById('gp-body');
+            const btn = document.getElementById('gp-shrink-btn');
+            const isCollapsed = body.style.display === 'none';
+            body.style.display = isCollapsed ? 'block' : 'none';
+            btn.textContent = isCollapsed ? '−' : '+';
+        });
+
+        document.getElementById('gp-fill-method').addEventListener('change', (e) => {
+            usw.ghostBot.fillMethod = e.target.value;
+            localStorage.setItem("gp_fill_method", e.target.value);
+            ghostPixelData = null;
+            log(LOG_LEVELS.info, `Fill method changed to: ${e.target.options[e.target.selectedIndex].text}`);
+        });
+
+        document.getElementById('gp-energy-threshold').addEventListener('change', (e) => {
+            const val = parseInt(e.target.value) || 1;
+            usw.ghostBot.targetEnergyThreshold = val;
+            localStorage.setItem("gp_energy_threshold", val);
+            log(LOG_LEVELS.info, `Trigger energy threshold set to: ${val}`);
+        });
+
+        document.getElementById('gp-start-btn').addEventListener('click', () => {
+            setStatus("Calisiyor", "#22c55e");
+            usw.ghostBot.start();
+        });
+
+        document.getElementById('gp-stop-btn').addEventListener('click', () => {
+            usw.ghostBot.stop();
+        });
+
+        document.getElementById('gp-reload-btn').addEventListener('click', () => {
+            usw.ghostBot.reload();
+            log(LOG_LEVELS.info, "Bot state reloaded.");
+        });
+
+        document.getElementById('gp-toggle-transparent').addEventListener('change', (e) => {
+            usw.ghostBot.placeTransparentGhostPixels = e.target.checked;
+            localStorage.setItem("gp_place_transparent", e.target.checked);
+            ghostPixelData = null;
+            log(LOG_LEVELS.info, `Transparent pixels: ${e.target.checked}`);
+        });
+
+        document.getElementById('gp-toggle-free').addEventListener('change', (e) => {
+            usw.ghostBot.placeFreeColors = e.target.checked;
+            localStorage.setItem("gp_place_free", e.target.checked);
+            ghostPixelData = null;
+            log(LOG_LEVELS.info, `Place free colors: ${e.target.checked}`);
+        });
+
+        document.getElementById('gp-toggle-sound').addEventListener('change', (e) => {
+            usw.ghostBot.soundEnabled = e.target.checked;
+            localStorage.setItem("gp_sound", e.target.checked);
+            log(LOG_LEVELS.info, `Sound notification: ${e.target.checked}`);
+        });
+
+        document.getElementById('gp-toggle-owned').addEventListener('change', (e) => {
+            usw.ghostBot.onlyOwnedColors = e.target.checked;
+            localStorage.setItem("gp_only_owned", e.target.checked);
+            ghostPixelData = null;
+            log(LOG_LEVELS.info, `Sadece hesap renkleri: ${e.target.checked}`);
+            detectOwnedColors(false);
+        });
+
+        document.getElementById('gp-detect-btn').addEventListener('click', () => {
+            detectOwnedColors();
+        });
+
+        document.getElementById('gp-ignore-btn').addEventListener('click', () => {
+            const val = document.getElementById('gp-ignore-input').value;
+            usw.ghostBot.ignoreColors(val);
+        });
+
+        // Canli istatistik guncellemesi
+        setInterval(() => {
+            const energyEl = document.getElementById('gp-energy-display');
+            if (energyEl) {
+                try {
+                    energyEl.textContent = (typeof currentEnergy !== 'undefined' && currentEnergy !== null) ? currentEnergy : '?';
+                } catch (e) { energyEl.textContent = '?'; }
+            }
+            const rateEl = document.getElementById('gp-rate-display');
+            const timeEl = document.getElementById('gp-time-display');
+            if (statsStartTime && rateEl && timeEl) {
+                const elapsedMin = (Date.now() - statsStartTime) / 60000;
+                const elapsedSec = Math.floor((Date.now() - statsStartTime) / 1000);
+                const mm = String(Math.floor(elapsedSec / 60)).padStart(2, '0');
+                const ss = String(elapsedSec % 60).padStart(2, '0');
+                timeEl.textContent = `${mm}:${ss}`;
+                rateEl.textContent = elapsedMin > 0.02 ? Math.round(sessionPlacedCount / elapsedMin) : 0;
+            }
+            const barEl = document.getElementById('gp-progress-bar');
+            const txtEl = document.getElementById('gp-progress-text');
+            if (barEl && txtEl && statsTotal > 0) {
+                const done = Math.max(0, statsTotal - statsRemaining);
+                const pct = Math.min(100, Math.round((done / statsTotal) * 100));
+                barEl.style.width = pct + '%';
+                txtEl.textContent = `${pct}% (${done}/${statsTotal})`;
+            }
+        }, 1000);
+
+        // Colors global'i hazir olunca otomatik algila (max 20 sn bekle)
+        let tries = 0;
+        const detectTimer = setInterval(() => {
+            if (readRawColors()) {
+                clearInterval(detectTimer);
+                detectOwnedColors(false);
+            } else if (++tries > 40) {
+                clearInterval(detectTimer);
+                const box = document.getElementById('gp-owned-swatches');
+                if (box) box.innerHTML = '<span style="color:#f87171; font-size:10px;">Renk listesi bulunamadi. Giris yaptigindan emin ol.</span>';
+            }
+        }, 500);
+    }
+
+    const tryRelog = withErrorHandling(async function () {
+        tokenUser = "";
+
+        if (GOOGLE_CLIENT_ID) {
+            log(LOG_LEVELS.info, "attempting relog with google");
+            await new Promise((resolve) => {
+                google.accounts.id.initialize({
+                    client_id: GOOGLE_CLIENT_ID,
+                    callback: async (e) => {
+                        const r = await fetch("/auth/google", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ token: e.credential }),
+                        });
+                        if (!r.ok) return log(LOG_LEVELS.info, "Google authentication failed");
+                        const data = await r.json();
+                        await logIn(data);
+
+                        resolve();
+                    },
+                    auto_select: true,
+                    context: "signin",
+                });
+
+                google.accounts.id.prompt();
+            });
+        }
+
+        log(LOG_LEVELS.info, `Relog ${tokenUser.length ? "successful" : "failed"}`);
+        return !!tokenUser.length;
+    });
+
+    function getGhostImageData() {
+        if (!ghostImageOriginalData || !ghostImageTopLeft) return null;
+        return canvasToImageData(
+            ghostImageOriginalData,
+            ghostImageTopLeft.gridX,
+            ghostImageTopLeft.gridY
+        );
+    }
+
+    function setGhostPixelData() {
+        ghostData = Array.from(getGhostImageData().values());
+
+        // Hesap renkleri filtresi (sadece sahip olunan renkler)
+        let ownedIds = null;
+        if (usw.ghostBot.onlyOwnedColors) {
+            ownedIds = getOwnedColorIds();
+            if (!ownedIds && !ownedWarned) {
+                ownedWarned = true;
+                log(LOG_LEVELS.warn, "Hesap renk listesi (Colors) okunamadi! Filtre devre disi birakildi.");
+            }
+        }
+        ownedColorSignature = getOwnedColorsSignature();
+
+        ghostPixelData = ghostData.filter((d) => {
+            return (
+                (usw.ghostBot.placeTransparentGhostPixels || d.color.a > 0) &&
+                (usw.ghostBot.placeFreeColors || !FREE_COLOR_IDS.has(d.color.id())) &&
+                (ownedIds === null || ownedIds.includes(d.color.id())) &&
+                !ignoredColors.has(d.color.id())
+            );
+        });
+    }
+
+    function getGhostPixelData() {
+        if (!ghostPixelData) setGhostPixelData();
+        return ghostPixelData;
+    }
+
+    function getGhostData() {
+        if (!ghostData) setGhostPixelData();
+        return ghostData;
+    }
+
+    const updatePlacedPixels = withErrorHandling(async function () {
+        const ghostData = getGhostData();
+        const topLeft = ghostData[0].gridCoord;
+        const bottomRight = ghostData[ghostData.length - 1].gridCoord;
+
+        const tileCoords = getAllCoordsBetween(topLeft, bottomRight, SYNC_TILE_SIZE);
+
+        async function fetchTiles(tiles) {
+            return await fetch(`/GetPixelsCached`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    Tiles: tiles.map((t) => ({ ...t, timestamp: lastServerTimestamp })),
+                }),
+            });
+        }
+
+        for (let i = 0; i < tileCoords.length; i += 9) {
+            const r = await (await fetchTiles(tileCoords.slice(i, i + 9))).json();
+            if (r.ServerTimestamp) lastServerTimestamp = r.ServerTimestamp;
+            for (const [n, tile] of Object.entries(r.Tiles)) {
+                const coord = n.split("_").map(Number).filter(Number.isFinite);
+                if (tile.Type == "delta" && tile.Pixels.length)
+                    for (const p of tile.Pixels) {
+                        const [gridX, gridY, color, userId] = p;
+                        placedPixelData.set(`${gridX},${gridY}`, {
+                            gridCoord: { x: gridX, y: gridY },
+                            color: new Color(color),
+                        });
+                    }
+                else if (tile.Type == "full") {
+                    const canvasData = await webpToCanvasData(tile.ColorWebP, SYNC_TILE_SIZE, SYNC_TILE_SIZE);
+                    canvasToImageData(canvasData, +coord[0], +coord[1] + SYNC_TILE_SIZE - 1, placedPixelData);
+                }
+            }
+        }
+    });
+
+    Array.prototype.orderGhostPixels = function () {
+        const method = usw.ghostBot.fillMethod || "mixed";
+
+        if (method === "blocks_first") {
+            // En cok blok cikaran rengi bastan sona bitirir, sonra siradakine gecer
+            const freqMap = new Map();
+            this.forEach((pixel) => {
+                const val = pixel.color.id();
+                freqMap.set(val, (freqMap.get(val) || 0) + 1);
+            });
+            return this.sort((a, b) => {
+                const diff = freqMap.get(b.color.id()) - freqMap.get(a.color.id());
+                if (diff !== 0) return diff;
+                return (a.gridCoord.x - b.gridCoord.x) || (b.gridCoord.y - a.gridCoord.y);
+            });
+        } else if (method === "frequency") {
+            const freqMap = new Map();
+            this.forEach((pixel) => {
+                const val = pixel.color.id();
+                freqMap.set(val, (freqMap.get(val) || 0) + 1);
+            });
+            return this.sort((a, b) => {
+                const aFreq = freqMap.get(a.color.id());
+                const bFreq = freqMap.get(b.color.id());
+                return aFreq - bFreq;
+            });
+        } else if (method === "mixed") {
+            // Ucretsiz ve ucretli pikselleri karistir, harmanla
+            const freeGroup = this.filter((d) => FREE_COLOR_IDS.has(d.color.id())).sort(() => Math.random() - 0.5);
+            const paidGroup = this.filter((d) => !FREE_COLOR_IDS.has(d.color.id())).sort(() => Math.random() - 0.5);
+            const comp = `${freeGroup.length}/${paidGroup.length}`;
+            if (comp !== lastMixedComp) {
+                lastMixedComp = comp;
+                log(LOG_LEVELS.info, `Mix mode: ${freeGroup.length} free + ${paidGroup.length} paid pixels harmanlandi.`);
+            }
+            return interleaveGroups([freeGroup, paidGroup]);
+        } else if (method === "random") {
+            return this.sort(() => Math.random() - 0.5);
+        } else if (method === "top_to_bottom") {
+            return this.sort((a, b) => b.gridCoord.y - a.gridCoord.y || a.gridCoord.x - b.gridCoord.x);
+        } else if (method === "bottom_to_top") {
+            return this.sort((a, b) => a.gridCoord.y - b.gridCoord.y || a.gridCoord.x - b.gridCoord.x);
+        } else if (method === "left_to_right") {
+            return this.sort((a, b) => a.gridCoord.x - b.gridCoord.x || b.gridCoord.y - a.gridCoord.y);
+        } else if (method === "right_to_left") {
+            return this.sort((a, b) => b.gridCoord.x - a.gridCoord.x || b.gridCoord.y - a.gridCoord.y);
+        } else if (method === "diagonal") {
+            return this.sort((a, b) => (a.gridCoord.x + a.gridCoord.y) - (b.gridCoord.x + b.gridCoord.y));
+        } else if (method === "nearest") {
+            if (this.length > 50000) {
+                // O(n^2) — milyonlarca pikselde sekme donar, random'a dus
+                log(LOG_LEVELS.warn, `Nearest modu ${this.length.toLocaleString()} piksel icin cok yavas, random'a dusuldu.`);
+                return this.sort(() => Math.random() - 0.5);
+            }
+            let sorted = [];
+            let current = { x: this[0]?.gridCoord.x || 0, y: this[0]?.gridCoord.y || 0 };
+            let remaining = [...this];
+            while (remaining.length > 0) {
+                remaining.sort((a, b) => {
+                    const distA = Math.hypot(a.gridCoord.x - current.x, a.gridCoord.y - current.y);
+                    const distB = Math.hypot(b.gridCoord.x - current.x, b.gridCoord.y - current.y);
+                    return distA - distB;
+                });
+                let next = remaining.shift();
+                sorted.push(next);
+                current = next.gridCoord;
+            }
+            return sorted;
+        }
+        return this;
+    };
+
+    const getPixelsToPlace = withErrorHandling(async function () {
+        // Oyun icinde yeni renk satin aldiysan listeyi otomatik tazele
+        const sig = getOwnedColorsSignature();
+        if (sig && sig !== ownedColorSignature) {
+            log(LOG_LEVELS.info, "Hesap renkleri degismis, liste guncelleniyor...");
+            ghostPixelData = null;
+            if (statsStartTime) statsTotal = getGhostPixelData().length;
+        }
+
+        await updatePlacedPixels();
+
+        return getGhostPixelData()
+            .orderGhostPixels()
+            .filter((d) => {
+                const placedPixel = placedPixelData.get(`${d.gridCoord.x},${d.gridCoord.y}`);
+                return !placedPixel || placedPixel.color.id() !== d.color.id();
+            });
+    });
+
+    const sendPixels = withErrorHandling(async function (pixels) {
+        if (!pixels || pixels.length === 0) return;
+        const r = await fetch("https://geopixels.net/PlacePixel", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                Token: tokenUser,
+                Subject: subject,
+                UserId: userID,
+                Pixels: pixels.map((c) => ({ ...c, UserId: userID })),
+            }),
+        });
+        if (!r.ok) {
+            log(LOG_LEVELS.warn, "Failed to place pixels. : " + (await r.text()));
+            if (r.status == 401 && (await tryRelog())) await sendPixels(pixels);
+        } else {
+            sessionPlacedCount += pixels.length;
+            const counterEl = document.getElementById("gp-placed-counter");
+            if (counterEl) counterEl.textContent = sessionPlacedCount;
+            if (usw.ghostBot.soundEnabled) playBeep(880, 0.12);
+            log(LOG_LEVELS.info, `Placed ${pixels.length} pixels! (Total: ${sessionPlacedCount})`);
+        }
+    });
+
+    let stopWhileLoop = false;
+    let promiseResolve;
+
+    const startGhostBot = withErrorHandling(async function () {
+        if (isRunning) {
+            log(LOG_LEVELS.warn, "Bot zaten calisiyor! Once Stop'a bas.");
+            return;
+        }
+        if (!ghostImage || !ghostImageOriginalData || !ghostImageTopLeft) {
+            log(LOG_LEVELS.warn, "Ghost image not loaded.");
+            return;
+        }
+        stopWhileLoop = false;
+        isRunning = true;
+        statsStartTime = Date.now();
+        lastMixedComp = "";
+        try {
+            statsTotal = getGhostPixelData().length;
+            statsRemaining = statsTotal;
+            log(LOG_LEVELS.info, `Hedef: ${statsTotal.toLocaleString()} piksel (${usw.ghostBot.onlyOwnedColors ? "sadece hesap renkleri" : "tum renkler"}).`);
+
+            while (!stopWhileLoop) {
+                const targetThreshold = usw.ghostBot.targetEnergyThreshold;
+
+                // Trigger energy check
+                if (currentEnergy < targetThreshold) {
+                    log(LOG_LEVELS.info, `Energy (${currentEnergy}/${targetThreshold}). Waiting for refill...`);
+                    setStatus("Enerji bekleniyor", "#facc15");
+
+                    // Poll energy state every 3 seconds until threshold is met or stopped
+                    while (!stopWhileLoop && currentEnergy < usw.ghostBot.targetEnergyThreshold) {
+                        await new Promise((resolve) => {
+                            promiseResolve = resolve;
+                            setTimeout(resolve, 3000);
+                        });
+                    }
+                }
+
+                if (stopWhileLoop) break;
+                setStatus("Calisiyor", "#22c55e");
+
+                const pixelsToPlace = await getPixelsToPlace();
+                if (!pixelsToPlace) break; // hata olustu, disarida loglandi
+                if (pixelsToPlace.length === 0) {
+                    statsRemaining = 0;
+                    log(LOG_LEVELS.info, "All pixels are correctly placed.");
+                    setStatus("Tamamlandi!", "#4ade80");
+                    if (usw.ghostBot.soundEnabled) playBeep(1320, 0.3);
+                    break;
+                }
+
+                // Dump all available current energy at once
+                const batchSize = Math.min(currentEnergy, pixelsToPlace.length);
+                const pixelsThisRequest = pixelsToPlace.slice(0, batchSize);
+                if (pixelsThisRequest.length === 0) {
+                    // Enerji kontrolu ile gonderim arasinda enerji bitti, kisa bekle ve donguye don
+                    await new Promise((resolve) => {
+                        promiseResolve = resolve;
+                        setTimeout(resolve, 2000);
+                    });
+                    continue;
+                }
+                statsRemaining = pixelsToPlace.length - pixelsThisRequest.length;
+                log(LOG_LEVELS.info, `Trigger met (${currentEnergy} energy). Placing ${pixelsThisRequest.length} pixels...`);
+
+                await sendPixels(
+                    pixelsThisRequest.map((d) => ({
+                        GridX: d.gridCoord.x,
+                        GridY: d.gridCoord.y,
+                        Color: d.color.id(),
+                    }))
+                );
+
+                if (!tokenUser) {
+                    log(LOG_LEVELS.warn, "Logged out => stopping bot.");
+                    break;
+                }
+                if (pixelsToPlace.length === pixelsThisRequest.length) {
+                    statsRemaining = 0;
+                    log(LOG_LEVELS.info, "All pixels are correctly placed.");
+                    setStatus("Tamamlandi!", "#4ade80");
+                    if (usw.ghostBot.soundEnabled) playBeep(1320, 0.3);
+                    break;
+                }
+
+                // Small delay to let game state update before re-checking energy loop
+                await new Promise((resolve) => {
+                    promiseResolve = resolve;
+                    setTimeout(resolve, 2000);
+                });
+            }
+        } finally {
+            isRunning = false;
+            setStatus("Durdu", "#ef4444");
+        }
+    });
+
+    window.addEventListener('load', () => {
+        setTimeout(createUI, 1500);
+    });
+
+    log(
+        LOG_LEVELS.info,
+        "GhostPixel Bot v0.10.1 loaded: Owned-color detection, Mix & Blocks-First modes, live stats."
+    );
+})();
